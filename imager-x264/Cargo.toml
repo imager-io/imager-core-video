@@ -1,0 +1,8 @@
+[package]
+name = "imager-x264"
+version = "0.1.0"
+authors = ["colbyn <hello@colbyn.com>"]
+edition = "2018"
+publish = false
+
+[dependencies]
