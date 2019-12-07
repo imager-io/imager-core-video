@@ -177,3 +177,12 @@ unsafe fn vmaf_controller(source1: Yuv420P, source2: Yuv420P) -> f64 {
     // DONE
     vmaf_score
 }
+
+pub fn run() {
+    let source1 = Yuv420P::open("assets/samples/1.jpeg");
+    let source2 = Yuv420P::open("assets/samples/1.jpeg");
+    let report = unsafe {
+        vmaf_controller(source1, source2)
+    };
+    println!("report: {}", report);
+}

@@ -4,5 +4,6 @@ pub mod encoder;
 pub mod yuv420p;
 
 fn main() {
-    encoder::run();
+    // encoder::run();
+    vmaf::run();
 }
