@@ -5,43 +5,44 @@ use std::path::PathBuf;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use libc::{size_t, c_float, c_void};
+use crate::yuv420p::Yuv420P;
 
 ///////////////////////////////////////////////////////////////////////////////
 // MEDIA
 ///////////////////////////////////////////////////////////////////////////////
 
-#[derive(Clone)]
-pub struct Yuv420pImage {
-    pub width: u32,
-    pub height: u32,
-    pub linesize: u32,
-    pub buffer: Vec<u8>,
-}
+// #[derive(Clone)]
+// pub struct Yuv420pImage {
+//     pub width: u32,
+//     pub height: u32,
+//     pub linesize: u32,
+//     pub buffer: Vec<u8>,
+// }
 
-impl Yuv420pImage {
-    pub fn decode_with_format(data: &Vec<u8>, format: ::image::ImageFormat) -> Self {
-        use image::{DynamicImage, GenericImage, GenericImageView};
-        let data = ::image::load_from_memory_with_format(data, format).expect("load image from memory");
-        Yuv420pImage::from_image(&data)
-    }
-    pub fn from_image(data: &::image::DynamicImage) -> Self {
-        use image::{DynamicImage, GenericImage, GenericImageView};
-        let (width, height) = data.dimensions();
-        let rgb = data
-            .to_rgb()
-            .pixels()
-            .map(|x| x.0.to_vec())
-            .flatten()
-            .collect::<Vec<_>>();
-        let yuv = rgb2yuv420::convert_rgb_to_yuv420p(&rgb, width, height, 1);
-        Yuv420pImage {
-            width,
-            height,
-            linesize: width,
-            buffer: yuv,
-        }
-    }
-}
+// impl Yuv420pImage {
+//     pub fn decode_with_format(data: &Vec<u8>, format: ::image::ImageFormat) -> Self {
+//         use image::{DynamicImage, GenericImage, GenericImageView};
+//         let data = ::image::load_from_memory_with_format(data, format).expect("load image from memory");
+//         Yuv420pImage::from_image(&data)
+//     }
+//     pub fn from_image(data: &::image::DynamicImage) -> Self {
+//         use image::{DynamicImage, GenericImage, GenericImageView};
+//         let (width, height) = data.dimensions();
+//         let rgb = data
+//             .to_rgb()
+//             .pixels()
+//             .map(|x| x.0.to_vec())
+//             .flatten()
+//             .collect::<Vec<_>>();
+//         let yuv = rgb2yuv420::convert_rgb_to_yuv420p(&rgb, width, height, 3);
+//         Yuv420pImage {
+//             width,
+//             height,
+//             linesize: width,
+//             buffer: yuv,
+//         }
+//     }
+// }
 
 ///////////////////////////////////////////////////////////////////////////////
 // VMAF CONTEXT
@@ -56,8 +57,8 @@ struct Context {
 
 #[repr(C)]
 struct VmafReportContext {
-    source1: Yuv420pImage,
-    source2: Yuv420pImage,
+    source1: Yuv420P,
+    source2: Yuv420P,
     frames_set: bool,
 }
 
@@ -66,23 +67,14 @@ struct VmafReportContext {
 // VMAF CALLBACK
 ///////////////////////////////////////////////////////////////////////////////
 
+
 unsafe fn fill_vmaf_buffer(
     mut output: *mut c_float,
     output_stride: c_int,
-    source: &Yuv420pImage,
+    source: &Yuv420P,
 ) {
-    let (width, height) = (source.width, source.height);
-    let src_linesize = source.linesize as usize;
-    let dest_stride = output_stride as usize;
-    let mut source_ptr: *const u8 = source.buffer.as_ptr();
-    for y in 0..height {
-        for x in 0..width {
-            let s1_px: u8 = *(source_ptr.offset(x as isize));
-            let s1_px: c_float = s1_px as c_float;
-            *(output.offset(x as isize)) = s1_px
-        }
-        source_ptr = source_ptr.add(src_linesize / std::mem::size_of_val(&*source_ptr));
-        output = output.add(dest_stride / std::mem::size_of_val(&*output));
+    for (i, px) in source.y.iter().enumerate() {
+        *output.offset(i as isize) = px.clone() as c_float;
     }
 }
 
@@ -97,49 +89,14 @@ unsafe extern "C" fn read_frame(
     let mut vmaf_ctx = Box::from_raw(raw_ctx as *mut VmafReportContext);
     let mut vmaf_ctx = Box::leak(vmaf_ctx);
 
-    // RESOLUTION
-    let width = vmaf_ctx.source1.width;
-    let height = vmaf_ctx.source1.height;
-
-    // Y PLANE DATA
-    let mut source1_in: *mut u8 = vmaf_ctx.source1.buffer.as_mut_ptr();
-    let mut source2_in: *mut u8 = vmaf_ctx.source2.buffer.as_mut_ptr();
-
-    // Y PLANE LINESIZE
-    let source1_linesize: usize = vmaf_ctx.source1.linesize as usize;
-    let source2_linesize: usize = vmaf_ctx.source2.linesize as usize;
-    
-    // OUTPUT LINESIZE
-    let out_stride = out_stride as usize;
-
     // DONE
     if vmaf_ctx.frames_set {
         return 2;
     }
     
     // FILL BUFFERS (THE EXTREMELY UNSAFE, DANGEROUS AND CONFUSING PART)
-    for y in 0..height {
-        for x in 0..width {
-            // GET - SOURCE 1 & 2
-            let s1_px: u8 = *(source1_in.offset(x as isize));
-            let s2_px: u8 = *(source2_in.offset(x as isize));
-
-            // CONVERT - SOURCE 1 & 2
-            let s1_px: c_float = s1_px as c_float;
-            let s2_px: c_float = s2_px as c_float;
-
-            // SET - OUTPUT 1 & 2
-            *(source1_out.offset(x as isize)) = s1_px;
-            *(source2_out.offset(x as isize)) = s2_px;
-        }
-        // UPDATE - SOURCE 1
-        source1_in = source1_in.add(source1_linesize / std::mem::size_of_val(&*source1_in));
-        source1_out = source1_out.add(out_stride / std::mem::size_of_val(&*source1_out));
-
-        // UPDATE - SOURCE 2
-        source2_in = source2_in.add(source2_linesize / std::mem::size_of_val(&*source2_in));
-        source2_out = source2_out.add(out_stride / std::mem::size_of_val(&*source2_out));
-    }
+    fill_vmaf_buffer(source1_out, out_stride, &vmaf_ctx.source1);
+    fill_vmaf_buffer(source2_out, out_stride, &vmaf_ctx.source2);
     vmaf_ctx.frames_set = true;
     return 0;
 }
@@ -149,7 +106,7 @@ unsafe extern "C" fn read_frame(
 // VMAF PIPELINE
 ///////////////////////////////////////////////////////////////////////////////
 
-unsafe fn vmaf_controller(source1: Yuv420pImage, source2: Yuv420pImage) -> f64 {
+unsafe fn vmaf_controller(source1: Yuv420P, source2: Yuv420P) -> f64 {
     // RESOLUTION REQUIREMENTS
     assert!(source1.width == source2.width);
     assert!(source1.height == source2.height);
