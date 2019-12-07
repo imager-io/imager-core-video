@@ -5,59 +5,23 @@ use std::convert::AsRef;
 use std::path::{PathBuf, Path};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
+use std::collections::VecDeque;
 use libc::{size_t, c_float, c_void, fread};
 use x264_dev::{raw, sys};
+use itertools::Itertools;
 use crate::yuv420p::Yuv420P;
+use crate::stream::{Stream, FileStream, SingleImage};
 
-///////////////////////////////////////////////////////////////////////////////
-// DATA TYPES
-///////////////////////////////////////////////////////////////////////////////
-
-// #[derive(Clone)]
-// pub struct Yuv420pImage {
-//     pub width: u32,
-//     pub height: u32,
-//     pub linesize: u32,
-//     pub buffer: Vec<u8>,
-// }
-
-// impl Yuv420pImage {
-//     pub fn open<P: AsRef<Path>>(path: P) -> Self {
-//         let media = ::image::open(path).expect("failed to read image file");
-//         Yuv420pImage::from_image(&media)
-//     }
-//     pub fn decode_with_format(data: &Vec<u8>, format: ::image::ImageFormat) -> Self {
-//         use image::{DynamicImage, GenericImage, GenericImageView};
-//         let data = ::image::load_from_memory_with_format(data, format).expect("load image from memory");
-//         Yuv420pImage::from_image(&data)
-//     }
-//     pub fn from_image(data: &::image::DynamicImage) -> Self {
-//         use image::{DynamicImage, GenericImage, GenericImageView};
-//         let (width, height) = data.dimensions();
-//         let rgb = data
-//             .to_rgb()
-//             .pixels()
-//             .map(|x| x.0.to_vec())
-//             .flatten()
-//             .collect::<Vec<_>>();
-//         let yuv = rgb2yuv420::convert_rgb_to_yuv420p(&rgb, width, height, 3);
-//         Yuv420pImage {
-//             width,
-//             height,
-//             linesize: width,
-//             buffer: yuv,
-//         }
-//     }
-// }
 
 ///////////////////////////////////////////////////////////////////////////////
 // FUNCTIONS
 ///////////////////////////////////////////////////////////////////////////////
 
-fn init_param(width: u32, height: u32) -> sys::X264ParamT {
+fn init_param(width: u32, height: u32, dump: &str) -> sys::X264ParamT {
     let mut param: sys::X264ParamT = unsafe {std::mem::zeroed()};
     // let preset = CString::new("placebo").expect("CString failed");
-    let preset = CString::new("medium").expect("CString failed");
+    let preset = CString::new("ultrafast").expect("CString failed");
+    // let preset = CString::new("medium").expect("CString failed");
     let tune = CString::new("ssim").expect("CString failed");
     let profile = CString::new("high").expect("CString failed");
     
@@ -70,6 +34,9 @@ fn init_param(width: u32, height: u32) -> sys::X264ParamT {
         assert!(status == 0);
     };
 
+    param.rc.i_rc_method = 1;
+    // param.rc.i_qp_constant = 10;
+    param.rc.f_rf_constant = 40.0;
     param.i_bitdepth = 8;
     param.i_csp = raw::X264_CSP_I420 as i32;
     param.i_width  = width as i32;
@@ -77,6 +44,7 @@ fn init_param(width: u32, height: u32) -> sys::X264ParamT {
     param.b_vfr_input = 0;
     param.b_repeat_headers = 1;
     param.b_annexb = 1;
+    param.b_full_recon = 1;
 
     unsafe {
         let status = sys::x264_param_apply_profile(&mut param, profile.as_ptr());
@@ -88,13 +56,18 @@ fn init_param(width: u32, height: u32) -> sys::X264ParamT {
 
 fn encode() {
     // SOURCE
-    let mut source = Yuv420P::open("assets/samples/2yV-pyOxnPw300.jpeg");
+    let source_path = "assets/samples/sintel-trailer-gop1";
+    // let source_path = "assets/samples/gop-test-single";
+    let mut stream = FileStream::new(source_path, 1920, 818);
+    let mut vmaf_source = SingleImage::new(stream.width, stream.height);
+    let mut vmaf_derivative = SingleImage::new(stream.width, stream.height);
     // SETUP
-    let (width, height) = (source.width, source.height);
+    // let yuv_dump = CString::new("")
+    let (width, height) = (stream.width, stream.height);
     let linesize = width;
     let luma_size = width * height;
     let chroma_size = luma_size / 4;
-    let mut param = init_param(width, height);
+    let mut param = init_param(width, height, "assets/output/dump");
     let mut picture: sys::X264PictureT = unsafe {std::mem::zeroed()};
     let mut picture_output: sys::X264PictureT = unsafe {std::mem::zeroed()};
     unsafe {
@@ -120,7 +93,7 @@ fn encode() {
     // ENCODED OUTPUT
     let mut output = Vec::<u8>::new();
     // GO!
-    for frame in 0..1 {
+    while let Some(source) = stream.next() {
         let (mut y_ptr, mut u_ptr, mut v_ptr) = unsafe {(
             std::slice::from_raw_parts_mut(picture.img.plane[0], luma_size as usize),
             std::slice::from_raw_parts_mut(picture.img.plane[1], chroma_size as usize),
@@ -129,8 +102,6 @@ fn encode() {
         y_ptr.copy_from_slice(&source.y);
         u_ptr.copy_from_slice(&source.u);
         v_ptr.copy_from_slice(&source.v);
-        // META
-        picture.i_pts = frame;
         // ENCODE
         let i_frame_size = unsafe {
             sys::x264_encoder_encode(
@@ -151,6 +122,30 @@ fn encode() {
             };
             output.extend_from_slice(encoded);
         }
+        // RECONSTRUCT - GET DECODED DERIVATIVE
+        let report = unsafe {
+            vmaf_source.yuv = source;
+            vmaf_source.restart();
+            let (mut y_ptr, mut u_ptr, mut v_ptr) = unsafe {(
+                std::slice::from_raw_parts_mut(picture.img.plane[0], luma_size as usize),
+                std::slice::from_raw_parts_mut(picture.img.plane[1], chroma_size as usize),
+                std::slice::from_raw_parts_mut(picture.img.plane[2], chroma_size as usize),
+            )};
+            vmaf_derivative.yuv.y.copy_from_slice(y_ptr);
+            vmaf_derivative.yuv.u.copy_from_slice(u_ptr);
+            vmaf_derivative.yuv.v.copy_from_slice(v_ptr);
+            vmaf_derivative.restart();
+            crate::vmaf::vmaf_controller(
+                Box::new(vmaf_source.clone()),
+                Box::new(vmaf_derivative.clone()),
+            )
+        };
+        println!("report: {:?}", report);
+        // if picture_output.img.plane[0].is_null() {
+        //     println!("NULL");
+        // } else {
+        //     println!("NOT NULL");
+        // }
     }
     // FLUSH DELAYED FRAMES
     while unsafe{ sys::x264_encoder_delayed_frames(encoder) > 0 } {

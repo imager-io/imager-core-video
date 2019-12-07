@@ -2,66 +2,37 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use libc::{size_t, c_float, c_void};
+use lazy_static::lazy_static;
 use crate::yuv420p::Yuv420P;
+use crate::stream::{Stream, FileStream, SingleImage};
 
-///////////////////////////////////////////////////////////////////////////////
-// MEDIA
-///////////////////////////////////////////////////////////////////////////////
-
-// #[derive(Clone)]
-// pub struct Yuv420pImage {
-//     pub width: u32,
-//     pub height: u32,
-//     pub linesize: u32,
-//     pub buffer: Vec<u8>,
-// }
-
-// impl Yuv420pImage {
-//     pub fn decode_with_format(data: &Vec<u8>, format: ::image::ImageFormat) -> Self {
-//         use image::{DynamicImage, GenericImage, GenericImageView};
-//         let data = ::image::load_from_memory_with_format(data, format).expect("load image from memory");
-//         Yuv420pImage::from_image(&data)
-//     }
-//     pub fn from_image(data: &::image::DynamicImage) -> Self {
-//         use image::{DynamicImage, GenericImage, GenericImageView};
-//         let (width, height) = data.dimensions();
-//         let rgb = data
-//             .to_rgb()
-//             .pixels()
-//             .map(|x| x.0.to_vec())
-//             .flatten()
-//             .collect::<Vec<_>>();
-//         let yuv = rgb2yuv420::convert_rgb_to_yuv420p(&rgb, width, height, 3);
-//         Yuv420pImage {
-//             width,
-//             height,
-//             linesize: width,
-//             buffer: yuv,
-//         }
-//     }
-// }
 
 ///////////////////////////////////////////////////////////////////////////////
 // VMAF CONTEXT
 ///////////////////////////////////////////////////////////////////////////////
 
 struct Context {
-    width: u32,
-    height: u32,
-    frames: Vec<PathBuf>,
+    stream1: Box<dyn Stream>,
+    stream2: Box<dyn Stream>,
     frames_set: bool,
 }
 
-#[repr(C)]
-struct VmafReportContext {
-    source1: Yuv420P,
-    source2: Yuv420P,
-    frames_set: bool,
-}
+// #[repr(C)]
+// struct VmafReportContext {
+//     source1: Yuv420P,
+//     source2: Yuv420P,
+//     frames_set: bool,
+// }
 
+lazy_static! {
+    static ref VMAF_LOCK: Mutex<()> = {
+        Mutex::new(())
+    };
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // VMAF CALLBACK
@@ -73,8 +44,21 @@ unsafe fn fill_vmaf_buffer(
     output_stride: c_int,
     source: &Yuv420P,
 ) {
-    for (i, px) in source.y.iter().enumerate() {
-        *output.offset(i as isize) = px.clone() as c_float;
+    // for (i, px) in source.y.iter().enumerate() {
+    //     *output.offset(i as isize) = px.clone() as c_float;
+    // }
+    let (width, height) = (source.width, source.height);
+    let src_linesize = source.width as usize;
+    let dest_stride = output_stride as usize;
+    let mut source_ptr: *const u8 = source.y.as_ptr();
+    for y in 0..height {
+        for x in 0..width {
+            let s1_px: u8 = *(source_ptr.offset(x as isize));
+            let s1_px: c_float = s1_px as c_float;
+            *(output.offset(x as isize)) = s1_px
+        }
+        source_ptr = source_ptr.add(src_linesize / std::mem::size_of_val(&*source_ptr));
+        output = output.add(dest_stride / std::mem::size_of_val(&*output));
     }
 }
 
@@ -86,19 +70,30 @@ unsafe extern "C" fn read_frame(
     raw_ctx: *mut libc::c_void,
 ) -> c_int {
     // CONTEXT
-    let mut vmaf_ctx = Box::from_raw(raw_ctx as *mut VmafReportContext);
+    let mut vmaf_ctx = Box::from_raw(raw_ctx as *mut Context);
     let mut vmaf_ctx = Box::leak(vmaf_ctx);
 
     // DONE
     if vmaf_ctx.frames_set {
         return 2;
     }
-    
-    // FILL BUFFERS (THE EXTREMELY UNSAFE, DANGEROUS AND CONFUSING PART)
-    fill_vmaf_buffer(source1_out, out_stride, &vmaf_ctx.source1);
-    fill_vmaf_buffer(source2_out, out_stride, &vmaf_ctx.source2);
-    vmaf_ctx.frames_set = true;
-    return 0;
+
+    // NEXT FRAME OR DONE
+    match (vmaf_ctx.stream1.next(), vmaf_ctx.stream2.next()) {
+        (Some(frame1), Some(frame2)) => {
+            fill_vmaf_buffer(source1_out, out_stride, &frame1);
+            fill_vmaf_buffer(source2_out, out_stride, &frame2);
+        }
+        (None, None) => {
+            vmaf_ctx.frames_set = true;
+        }
+        _ => panic!()
+    }
+    if vmaf_ctx.frames_set {
+        2
+    } else {
+        0
+    }
 }
 
 
@@ -106,15 +101,15 @@ unsafe extern "C" fn read_frame(
 // VMAF PIPELINE
 ///////////////////////////////////////////////////////////////////////////////
 
-unsafe fn vmaf_controller(source1: Yuv420P, source2: Yuv420P) -> f64 {
-    // RESOLUTION REQUIREMENTS
-    assert!(source1.width == source2.width);
-    assert!(source1.height == source2.height);
+pub unsafe fn vmaf_controller(stream1: Box<dyn Stream>, stream2: Box<dyn Stream>) -> f64 {
+    // CHECKS
+    assert!(stream1.dimensions() == stream2.dimensions());
 
     // INIT VMAF CONTEXT
-    let mut vmaf_ctx = Box::new(VmafReportContext {
-        source1: source1.clone(),
-        source2: source2.clone(),
+    let (width, height) = stream1.dimensions();
+    let mut vmaf_ctx = Box::new(Context {
+        stream1: stream1,
+        stream2: stream2,
         frames_set: false
     });
     let vmaf_ctx = Box::into_raw(vmaf_ctx);
@@ -127,8 +122,6 @@ unsafe fn vmaf_controller(source1: Yuv420P, source2: Yuv420P) -> f64 {
         .to_owned();
     let model_path = CString::new(model_path).expect("CString::new failed");
     let mut fmt = CString::new(String::from("yuv420p")).expect("CString::new failed");
-    let width = source1.width;
-    let height = source1.height;
     let log_path: *mut c_char = std::ptr::null_mut();
     let log_fmt: *mut c_char = std::ptr::null_mut();
     let disable_clip = 0;
@@ -144,7 +137,7 @@ unsafe fn vmaf_controller(source1: Yuv420P, source2: Yuv420P) -> f64 {
     let enable_conf_interval = 0;
 
     // GO!
-    let compute_vmaf_res = vmaf_sys::compute_vmaf(
+    let status = vmaf_sys::compute_vmaf(
         &mut vmaf_score,
         fmt.as_ptr() as *mut c_char,
         width as c_int,
@@ -168,7 +161,7 @@ unsafe fn vmaf_controller(source1: Yuv420P, source2: Yuv420P) -> f64 {
     );
 
     // CHECK
-    assert!(compute_vmaf_res == 0);
+    assert!(status == 0);
 
     // CLEANUP
     let mut vmaf_ctx = Box::from_raw(vmaf_ctx);
@@ -178,11 +171,35 @@ unsafe fn vmaf_controller(source1: Yuv420P, source2: Yuv420P) -> f64 {
     vmaf_score
 }
 
+pub fn get_report(stream1: Box<dyn Stream>, stream2: Box<dyn Stream>) -> f64 {
+    // LOCK
+    let lock = VMAF_LOCK.lock().expect("failed to lock vmaf work");
+    // GO!
+    let score = unsafe {
+        vmaf_controller(stream1, stream2)
+    };
+    // UNLOCK
+    std::mem::drop(lock);
+    // DONE
+    score
+}
+
 pub fn run() {
+    // let mut stream1 = FileStream::new("assets/samples/gop-test-single", 1920, 818);
+    // let mut stream2 = FileStream::new("assets/samples/gop-test-single", 1920, 818);
     let source1 = Yuv420P::open("assets/samples/1.jpeg");
     let source2 = Yuv420P::open("assets/samples/1.jpeg");
-    let report = unsafe {
-        vmaf_controller(source1, source2)
+
+    let stream1 = SingleImage {
+        yuv: source1,
+        done: false,
     };
-    println!("report: {}", report);
+
+    let stream2 = SingleImage {
+        yuv: source2,
+        done: false,
+    };
+
+    let score = get_report(Box::new(stream1), Box::new(stream2));
+    println!("score: {}", score);
 }
