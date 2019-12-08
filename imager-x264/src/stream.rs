@@ -51,6 +51,15 @@ impl SingleImage {
         };
         SingleImage {yuv, done: false}
     }
+    pub fn fill_from_yuv_file<P: AsRef<Path>>(&mut self, path: P) {
+        let mut data = std::fs::read(path).expect("missing yuv source file for stream");
+        let luma_size = self.yuv.width * self.yuv.height;
+        let chroma_size = luma_size / 4;
+        self.yuv.y = data.drain(0 .. luma_size as usize).collect::<Vec<u8>>();
+        self.yuv.u = data.drain(0 .. chroma_size as usize).collect::<Vec<u8>>();
+        self.yuv.v = data.drain(0 .. chroma_size as usize).collect::<Vec<u8>>();
+        assert!(data.is_empty());
+    }
 }
 
 impl Stream for SingleImage {

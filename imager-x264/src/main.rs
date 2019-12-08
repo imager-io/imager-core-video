@@ -3,6 +3,7 @@ pub mod vmaf;
 pub mod encoder;
 pub mod yuv420p;
 pub mod stream;
+pub mod search;
 
 fn main() {
     encoder::run();
